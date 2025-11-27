@@ -247,7 +247,7 @@ def test_paged_attention(
         kv_indptr = data['kv_indptr'].clone().detach().to(TARGET_DEVICE)
         kv_page_indices = data['kv_indices'].clone().detach().to(TARGET_DEVICE)
         kv_last_page_len = data['kv_last_page_len'].clone().detach().to(TARGET_DEVICE)
-        page_size = data['page_size']
+        page_size = data['page_size'] if data['page_size'] else None
         block_size = data['block_size']
         max_seq_len = kv_indptr[1] - kv_indptr[0]
         kv_cache_dtype = data['kv_cache_dtype']
@@ -263,7 +263,7 @@ def test_paged_attention(
     fp8_out_scale = None
     num_seqs, num_heads, head_size = query.shape
     max_num_partitions = (
-        max_seq_len + _PARTITION_SIZE_ROCM - 1
+        8192 + _PARTITION_SIZE_ROCM - 1
     ) // _PARTITION_SIZE_ROCM
     assert _PARTITION_SIZE_ROCM % block_size == 0
 
@@ -287,12 +287,13 @@ def test_paged_attention(
     torch.cuda.synchronize()
     
     # Debug
-    print(f"[DEBUG pa_unit_test.py]  value_cache.is_contiguous()={value_cache.is_contiguous()}")
+    print(f"[DEBUG]  value_cache.is_contiguous()={value_cache.is_contiguous()}")
     print(f"[DEBUG] kv_indptr.shape={kv_indptr.shape}, kv_page_indices.shape={kv_page_indices.shape}, kv_last_page_len.shape={kv_last_page_len.shape}")
     print(f"[DEBUG] key_cache.shape={key_cache.shape}, value_cache.shape={value_cache.shape}")
     print(f"[DEBUG] kv_page_indices={kv_page_indices}")
     print(f"[DEBUG] kv_indptr[-10:]={kv_indptr[-10:]}")
     print(f"[DEBUG] kv_page_indices.max()={kv_page_indices.max()}, num_seqs*ctx_lens={num_seqs*ctx_lens}")
+    print(f"[DEBUG] max_num_partitions={max_num_partitions}")
     # print(f"[DEBUG] kv_last_page_len={kv_last_page_len}")
     # print(f"kv_indptr={kv_indptr}")
     
@@ -340,10 +341,6 @@ def test_paged_attention(
     # output size = torch.empty_like(query), dtype=dtype
     num_seqs, num_heads, head_size = query.shape
     block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]
-    _PARTITION_SIZE_ROCM = 256
-    max_num_partitions = (
-            max_seq_len + _PARTITION_SIZE_ROCM - 1
-        ) // _PARTITION_SIZE_ROCM
     nbyes_per_qo_elem = torch.finfo(query.dtype).bits // 8
     bytes_sizes = [num_seqs * num_heads * max_num_partitions * 4, 
                    num_seqs * num_heads * max_num_partitions * 4, 
