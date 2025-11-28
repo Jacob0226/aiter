@@ -275,6 +275,12 @@ def compile_template_op(
         folder = func_name
 
     if not_built(folder):
+        # Debug
+        print(f"[aiter utils.py] this template is not built")
+        if kwargs:
+            for key, value in kwargs.items():
+                print(f"Key: {key}, Value: {value}")
+                
         if includes is None:
             includes = []
         if sources is None:

@@ -1,16 +1,12 @@
 #!/bin/bash
 set -x
 
-# --- Fixed Environment Variables ---
-export BS=512     # Batch Size
-export ILEN=256   # Input Length (Context Length)
-
-# Define the list of PageSize values to loop through
 PAGE_SIZES=(1 16)
-
+BS_VALUES=(512 128 16) # 1024 OOM
+ILEN_VALUES=(256)
 # Define the list of OLEN values to loop through (Output Length / Max Generated Tokens)
-# The values correspond to: 2, 256, (1024-256=768), (2048-256=1792), (4096-256=3840)
-OLEN_VALUES=(2 256 768 1792 3840)
+# The values correspond to: 3, 256, (1024-256=768), (2048-256=1792), (4096-256=3840)
+OLEN_VALUES=(3 256 768 1792 3840)
 
 MODEL_PATH="/data/huggingface/hub/amd/grok-1-W4A8KV8"
 TOKENIZER_PATH="/data/huggingface/hub/Xenova/grok-1-tokenizer"
@@ -21,9 +17,9 @@ run_benchmark() {
     local version=$1      # QKV_VERSION (e.g., GOLDEN or EXPERIMENTAL)
     local page_size=$2    # Current PageSize value
 
-    # OLEN is now controlled by the outer loop and exported globally
+    # BS, ILEN, OLEN are now controlled by the outer loops and exported globally
     
-    # Construct SGLANG_ARGS based on the current page_size and the global OLEN
+    # Construct SGLANG_ARGS based on the current page_size, BS, ILEN, and OLEN
     SGLANG_ARGS="--batch-size ${BS} --input ${ILEN} --output ${OLEN} --tp 8 --page-size ${page_size} \
                  --quantization fp8 --trust-remote-code \
                  --model ${MODEL_PATH} \
@@ -31,13 +27,13 @@ run_benchmark() {
                  --attention-backend aiter --enable-profile-decode-rpd"
                    
     echo "======================================================"
-    echo "Starting Benchmark for Version: ${version} | PageSize: ${page_size} | OLEN: ${OLEN}"
+    echo "Starting Benchmark for Version: ${version} | BS: ${BS} | ILEN: ${ILEN} | PageSize: ${page_size} | OLEN: ${OLEN}"
     echo "======================================================"
 
     export QKV_VERSION="${version}"
     export PageSize="${page_size}" # Export PageSize for file naming
     
-    # Create the output filename (now includes OLEN and PageSize for uniqueness)
+    # Create the output filename (now includes BS, ILEN, OLEN, and PageSize for uniqueness)
     export OUT="E2E_bs${BS}_ilen${ILEN}_olen${OLEN}_PageSize${PageSize}_${QKV_VERSION}"
     
     # Execute the benchmark run
@@ -56,13 +52,25 @@ run_benchmark() {
 }
 
 # --- Main Execution Loop ---
-# Loop through all defined Output Lengths (OLEN)
-for CURR_OLEN in "${OLEN_VALUES[@]}"; do
-    export OLEN=${CURR_OLEN} # Set the output length for the current set of runs
+# Loop through all defined Page Sizes (PS) - Outermost loop
+for PS in "${PAGE_SIZES[@]}"; do
+    
+    # Loop through all defined Batch Sizes (BS)
+    for CURR_BS in "${BS_VALUES[@]}"; do
+        export BS=${CURR_BS} # Set the batch size for the current set of runs
 
-    # Loop through all defined Page Sizes (PS)
-    for PS in "${PAGE_SIZES[@]}"; do
-        run_benchmark "EXPERIMENTAL" "${PS}"
-        run_benchmark "GOLDEN" "${PS}"
+        # Loop through all defined Input Lengths (ILEN)
+        for CURR_ILEN in "${ILEN_VALUES[@]}"; do
+            export ILEN=${CURR_ILEN} # Set the input length for the current set of runs
+
+            # Loop through all defined Output Lengths (OLEN)
+            for CURR_OLEN in "${OLEN_VALUES[@]}"; do
+                export OLEN=${CURR_OLEN} # Set the output length for the current set of runs
+
+                # Run both versions for the current configuration (PageSize is fixed in this outer loop)
+                run_benchmark "EXPERIMENTAL" "${PS}"
+                run_benchmark "GOLDEN" "${PS}"
+            done
+        done
     done
 done
