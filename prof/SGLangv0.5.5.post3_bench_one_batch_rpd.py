@@ -590,9 +590,9 @@ def latency_test_run_once(
     profile_step_of_interest = output_len // 2
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     if enable_profile_decode_rpd and tp_rank == 0:
-            print("Start profile Decode")
-            decode_profile = rpdTracerControl()
-            decode_profile.start()
+        print("Start profile Decode")
+        decode_profile = rpdTracerControl()
+        decode_profile.start()
     for i in range(output_len - 1):
         synchronize(device)
         profiler = None
@@ -620,9 +620,7 @@ def latency_test_run_once(
                 trace_filename=trace_filename,
                 stage="decode",
             )
-        if enable_profile_decode_rpd and tp_rank == 0:
-            decode_profile.stop()
-
+        
         tot_latency += latency
         throughput = batch_size / latency
         decode_latencies.append(latency)
@@ -631,6 +629,8 @@ def latency_test_run_once(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
+    if enable_profile_decode_rpd and tp_rank == 0:
+        decode_profile.stop()
     # Record decode timing from 2nd output
     if output_len > 1:
         med_decode_latency = np.median(decode_latencies)
@@ -762,6 +762,10 @@ def latency_test(
 
 
 def main(server_args, bench_args):
+    if bench_args.enable_profile_prefill_rpd or bench_args.enable_profile_decode_rpd:
+        rpdTracerControl.setFilename(name = "trace.rpd", append=False)
+        profile = rpdTracerControl()
+
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
 
     _set_envs_and_config(server_args)
