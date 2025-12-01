@@ -275,12 +275,26 @@ def compile_template_op(
         folder = func_name
 
     if not_built(folder):
-        # Debug
+        # --------------------- Debug -------------------------
         print(f"[aiter utils.py] this template is not built")
         if kwargs:
             for key, value in kwargs.items():
                 print(f"Key: {key}, Value: {value}")
-                
+        debug_data = {
+            "folder": folder,
+            "kwargs": dict(kwargs) 
+        }
+        log_filename = os.path.join(folder, "aiter_compile_debug_info.json")
+        try:
+            # Write the debug information to a JSON file
+            with open(log_filename, 'w') as f:
+                json.dump(debug_data, f, indent=4)
+            print(f"[aiter utils.py] Debug info (folder and kwargs) saved to {log_filename}")
+        except Exception as e:
+            # Catch potential errors during file writing
+            print(f"[aiter utils.py] ERROR: Failed to save JSON debug info: {e}")
+        # ------------------ End of Debug -------------------------
+
         if includes is None:
             includes = []
         if sources is None:
