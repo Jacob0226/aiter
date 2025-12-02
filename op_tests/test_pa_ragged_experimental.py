@@ -196,14 +196,14 @@ def test_paged_attention(
     device: str,
     warmup_iter: int,
     num_iter: int,
-    profile: str,
+    enable_profile: bool,
 ) -> None:
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.set_default_device(device) 
     block_size = 1
-
+    
     if in_pt == None:
         # Using default kv_scale
         k_scale = v_scale = torch.tensor([1.0], dtype=dtypes.fp32)
@@ -325,7 +325,7 @@ def test_paged_attention(
     )
 
     
-    if profile == None:
+    if enable_profile == False:
         # Warmup
         for i in range(warmup_iter):
             _, _ = run_aiter(*ARGS_TUPLE, version='GOLDEN')
@@ -335,12 +335,21 @@ def test_paged_attention(
             workspace_experi, out_experi = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
     else:
         # Warmup
-        print(f"[DEBUG] Profile {profile}")
         for i in range(warmup_iter):
-            _, _ = run_aiter(*ARGS_TUPLE, version=profile)
+            _, _ = run_aiter(*ARGS_TUPLE, version='GOLDEN')
+            _, _ = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
+
+        print(f"[DEBUG] Profile {enable_profile}\n\n")
+        profile = rpdTracerControl() 
+        profile.start()
+        profile.start() # Not sure why need 2 profile.start() to capture the traces
         for i in range(num_iter):
-            _, _ = run_aiter(*ARGS_TUPLE, version=profile)
-        return
+            workspace_golden, out_golden = run_aiter(*ARGS_TUPLE, version='GOLDEN')
+            workspace_experi, out_experi = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
+        profile.flush()
+        profile.stop()
+
+        
 
 
     # Grok1-bf16-TP8 + bs512-ilen2048: 
@@ -473,10 +482,9 @@ if __name__ == "__main__":
         help="coldrun iterations",
     )
     parser.add_argument(
-        '--profile',
-        type=str,
-        choices=["GOLDEN", "EXPERIMENTAL"],
-        help='Enable RPD profiling: GOLDEN or EXPERIMENTAL'
+        '--enable-profile',
+        action="store_true",
+        help='Enable RPD profiling'
     )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
@@ -486,9 +494,12 @@ if __name__ == "__main__":
     ctx_len = args.ctx_len
     pa_variant = args.pa_variant
     quant_cache_dtype = args.quant_cache_dtype
-    if args.profile and args.warmup==0:
+    if args.enable_profile and args.warmup==0:
         args.warmup = 5
     # print(f"[DEBUG pa_unit_test.py] ctx_len={ctx_len}, pa_variant={pa_variant}, quant_cache_dtype={quant_cache_dtype}")
+    if args.enable_profile:
+        rpdTracerControl.setFilename(name = "trace_GOLDEN.rpd", append=False)
+        profile = rpdTracerControl() 
 
     page_size = args.page_size # Original block size is 1
     test_paged_attention(
@@ -509,9 +520,10 @@ if __name__ == "__main__":
         "cuda:0",    # device
         args.warmup,
         args.num_iters,
-        args.profile
+        args.enable_profile
     )
-    
+
+
 
 
 '''
