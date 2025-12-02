@@ -5,7 +5,7 @@ PAGE_SIZES=(1 16)
 BS_VALUES=(512 128 16) # 1024 OOM
 ILEN_VALUES=(256)
 # Define the list of OLEN values to loop through (Output Length / Max Generated Tokens)
-# The values correspond to: 3, 256, (1024-256=768), (2048-256=1792), (4096-256=3840)
+# The values correspond to: 3, (512-256=256), (1024-256=768), (2048-256=1792), (4096-256=3840)
 OLEN_VALUES=(3 256 768 1792 3840)
 
 MODEL_PATH="/data/huggingface/hub/amd/grok-1-W4A8KV8"

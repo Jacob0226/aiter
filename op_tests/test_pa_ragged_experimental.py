@@ -13,6 +13,7 @@ import argparse
 import os
 import numpy as np
 from aiter import paged_attention_ragged
+from rpdTracerControl import rpdTracerControl
 
 uniform_range = (-1, 1)
 class PAVariant(Enum):
@@ -194,6 +195,8 @@ def test_paged_attention(
     seed: int,
     device: str,
     warmup_iter: int,
+    num_iter: int,
+    profile: str,
 ) -> None:
     torch.manual_seed(seed)
     random.seed(seed)
@@ -321,12 +324,24 @@ def test_paged_attention(
         _PARTITION_SIZE_ROCM,
     )
 
-    # Warmup
-    for i in range(warmup_iter):
-        _, _ = run_aiter(*ARGS_TUPLE, version='GOLDEN')
-        _, _ = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
-    workspace_golden, out_golden = run_aiter(*ARGS_TUPLE, version='GOLDEN')
-    workspace_experi, out_experi = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
+    
+    if profile == None:
+        # Warmup
+        for i in range(warmup_iter):
+            _, _ = run_aiter(*ARGS_TUPLE, version='GOLDEN')
+            _, _ = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
+        for i in range(num_iter):
+            workspace_golden, out_golden = run_aiter(*ARGS_TUPLE, version='GOLDEN')
+            workspace_experi, out_experi = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
+    else:
+        # Warmup
+        print(f"[DEBUG] Profile {profile}")
+        for i in range(warmup_iter):
+            _, _ = run_aiter(*ARGS_TUPLE, version=profile)
+        for i in range(num_iter):
+            _, _ = run_aiter(*ARGS_TUPLE, version=profile)
+        return
+
 
     # Grok1-bf16-TP8 + bs512-ilen2048: 
     #    num_seqs=512, num_heads=6, max_num_partitions=8, head_size=128, nbyes_per_qo_elem=2
@@ -451,15 +466,28 @@ if __name__ == "__main__":
         default=5,
         help="warmup iterations",
     )
+    parser.add_argument(
+        "--num-iters",
+        type=int,
+        default=5,
+        help="coldrun iterations",
+    )
+    parser.add_argument(
+        '--profile',
+        type=str,
+        choices=["GOLDEN", "EXPERIMENTAL"],
+        help='Enable RPD profiling: GOLDEN or EXPERIMENTAL'
+    )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
     args.quant_cache_dtype = [
         None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
     ]
-
     ctx_len = args.ctx_len
     pa_variant = args.pa_variant
     quant_cache_dtype = args.quant_cache_dtype
+    if args.profile and args.warmup==0:
+        args.warmup = 5
     # print(f"[DEBUG pa_unit_test.py] ctx_len={ctx_len}, pa_variant={pa_variant}, quant_cache_dtype={quant_cache_dtype}")
 
     page_size = args.page_size # Original block size is 1
@@ -479,7 +507,9 @@ if __name__ == "__main__":
         quant_cache_dtype,
         0,           # seed
         "cuda:0",    # device
-        args.warmup
+        args.warmup,
+        args.num_iters,
+        args.profile
     )
     
 

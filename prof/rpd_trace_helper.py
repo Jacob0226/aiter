@@ -6,88 +6,141 @@ from typing import List, Dict, Any, Union
 def find_kernel_durations(
     file_path: str, 
     kernel_name_substring: str = "paged_attention_ll4mi_QKV_mfma16_kernel"
-) -> List[float]:
+) -> Dict[str, Union[float, int]]:
     """
-    從 Chrome Tracing JSON 檔案中讀取數據，篩選出特定 Kernel 的執行持續時間 (dur)。
+    Reads data from a Chrome Tracing JSON file and filters for the execution
+    durations ('dur') of a specific Kernel. Calculates min, max, avg, P90, and P95.
 
     Args:
-        file_path (str): JSON 檔案的路徑。
-        kernel_name_substring (str): 要查找的 Kernel 名稱子字符串。
+        file_path (str): Path to the JSON file.
+        kernel_name_substring (str): Substring of the Kernel name to look for.
 
     Returns:
-        List[float]: 包含所有匹配 Kernel 的持續時間列表。
+        Dict[str, Union[float, int]]: A dictionary containing statistics,
+        including the P95 duration under the key 'p95_duration'.
     """
     try:
-        # 1. 讀取 JSON 檔案
+        # 1. Read the JSON file
         with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            data: Union[Dict[str, Any], List[Any]] = json.load(f)
+            
+            # Attempt to extract the traceEvents list
+            if isinstance(data, dict) and 'traceEvents' in data:
+                events = data['traceEvents']
+            elif isinstance(data, list):
+                events = data # If the file is directly a list of events
+            else:
+                print("Warning: JSON structure does not contain 'traceEvents' key or is malformed.", file=sys.stderr)
+                return {}
+                
     except FileNotFoundError:
-        print(f"錯誤：找不到檔案 '{file_path}'。", file=sys.stderr)
-        return []
+        print(f"Error: File not found at '{file_path}'.", file=sys.stderr)
+        return {}
     except json.JSONDecodeError:
-        print(f"錯誤：檔案 '{file_path}' 不是有效的 JSON 格式。", file=sys.stderr)
-        return []
+        print(f"Error: File '{file_path}' is not a valid JSON format.", file=sys.stderr)
+        return {}
 
-    if not isinstance(data, dict) or 'traceEvents' not in data:
-        print("警告：JSON 結構不包含 'traceEvents' 鍵或格式錯誤。", file=sys.stderr)
-        return []
-        
     durations = []
     
-    # 2. 遍歷 traceEvents 列表
-    duration_500=0
-    for event in data['traceEvents']:
-        # 3. 篩選條件：'X' 事件, 必須有 'name', 'dur' 字段, 且名稱匹配
+    # Counter for durations > 500 (microsecond threshold)
+    duration_500_count = 0 
+    
+    # 2. Iterate through the events list
+    for event in events:
+        # 3. Filtering conditions: 'X' (Complete) event, must have 'name', 'dur' fields, and name must match
         if (event.get('ph') == 'X' and 
             'name' in event and 
             'dur' in event and
             kernel_name_substring in event['name']):
             
-            # 4. 記錄持續時間
+            # 4. Record the duration
             try:
-                # 確保轉換為浮點數
+                # Ensure conversion to float (durations are typically in microseconds)
                 duration = float(event['dur'])
                 durations.append(duration)
-                if duration>500:
-                    duration_500+=1
-                    print(f"duration={duration}, duration_500={duration_500}")
+                
+                # Check for duration > 500 (original logic)
+                if duration > 500:
+                    duration_500_count += 1
+                    # Real-time printing commented out as requested previously
+                    # print(f"duration={duration}, duration_500_count={duration_500_count}")
             except ValueError:
-                print(f"警告：發現非數值 'dur' 字段: {event['dur']}，已跳過。", file=sys.stderr)
+                print(f"Warning: Found non-numeric 'dur' field: {event['dur']}, skipped.", file=sys.stderr)
 
-
-    # 5. 輸出結果摘要
-    print(f"--- 分析結果摘要 ({kernel_name_substring}) ---")
-    print(f"找到 {len(durations)} 個匹配的 Kernel 執行記錄。")
-    if durations:
-        print(f"最短持續時間 (min dur): {min(durations):.4f}")
-        print(f"最長持續時間 (max dur): {max(durations):.4f}")
-        print(f"平均持續時間 (avg dur): {sum(durations) / len(durations):.4f}")
-    print("----------------------------------------")
     
-    return durations
+    # 5. Output Results Summary and Calculations
+    stats = {}
+    
+    print(f"\n--- Analysis Summary ({kernel_name_substring}) ---")
+    print(f"Found {len(durations)} matching Kernel execution records.")
+    
+    if durations:
+        # Sort for percentile calculation
+        sorted_durations = sorted(durations)
+        total_count = len(sorted_durations)
+        
+        # --- Percentile Calculation Helper Function ---
+        def calculate_percentile(data: List[float], percentile: float) -> float:
+            """Calculates the specific percentile (e.g., 0.9 for P90, 0.95 for P95)."""
+            n = len(data)
+            if n == 0:
+                return 0.0
+                
+            # Use the N*P/100 index method, rounded down to get the 0-based index
+            index = int(n * percentile)
+            
+            # Ensure index is within [0, n-1] range
+            index = max(0, min(index, n - 1))
+            return data[index]
+        
+        # Calculate P90
+        p90_duration = calculate_percentile(sorted_durations, 0.90)
+        
+        # Calculate P95
+        p95_duration = calculate_percentile(sorted_durations, 0.95)
 
-# --- 使用 argparse 處理命令列參數 ---
+        # Store statistics
+        stats['min_duration'] = min(durations)
+        stats['max_duration'] = max(durations)
+        stats['avg_duration'] = sum(durations) / total_count
+        stats['p90_duration'] = p90_duration
+        stats['p95_duration'] = p95_duration
+        stats['total_count'] = total_count
+        stats['count_dur_over_500us'] = duration_500_count # Include the 500us count
+
+        
+        print(f"Min Duration (min dur): {stats['min_duration']:.4f} us")
+        print(f"Max Duration (max dur): {stats['max_duration']:.4f} us")
+        print(f"Avg Duration (avg dur): {stats['avg_duration']:.4f} us")
+        print(f"**90th Percentile (P90): {stats['p90_duration']:.4f} us**")
+        print(f"**95th Percentile (P95): {stats['p95_duration']:.4f} us**")
+        print(f"Count > 500 us: {stats['count_dur_over_500us']}") # Display the 500us count
+        
+    print("---------------------------------------------")
+    
+    return stats
+
+# --- Use argparse to handle command-line arguments ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="分析 Chrome Tracing JSON 檔案，提取特定 Kernel 的持續時間。",
-        # 預設 target_name
-        epilog="預設 Kernel 子字符串為: paged_attention_ll4mi_QKV_mfma16_kernel"
+        description="Analyzes Chrome Tracing JSON files to extract specific Kernel durations and calculate statistics (including P90 and P95).",
+        epilog="Default Kernel substring is: paged_attention_ll4mi_QKV_mfma16_kernel"
     )
     
-    # -i 或 --input 參數，用於指定檔案路徑 (必需)
+    # -i or --input argument for file path (required)
     parser.add_argument(
         '-i', '--input', 
         type=str, 
         required=True,
-        help="輸入的 Chrome Tracing JSON 檔案路徑。"
+        help="Input Chrome Tracing JSON file path."
     )
     
-    # -k 或 --kernel 參數，用於指定要查找的 Kernel 名稱子字符串 (可選)
+    # -k or --kernel argument for the substring (optional)
     parser.add_argument(
         '-k', '--kernel', 
         type=str, 
         default="paged_attention_ll4mi_QKV_mfma16_kernel",
-        help="要篩選的 Kernel 名稱子字符串。"
+        help="Kernel name substring to filter for."
     )
 
     args = parser.parse_args()
@@ -95,11 +148,36 @@ if __name__ == "__main__":
     file_path = args.input
     target_name = args.kernel
     
-    # 執行分析
-    all_durations = find_kernel_durations(file_path, target_name)
+    # Execute analysis
+    stats = find_kernel_durations(file_path, target_name)
 
-    # 打印所有找到的持續時間
-    if all_durations:
-        print(f"\n所有 {target_name} 的持續時間 (dur):")
-        # 為了清晰，只打印前 10 個
-        print(all_durations[:10], "..." if len(all_durations) > 10 else "")
+    # --- Save P95 to a JSON file ---
+    P95_OUTPUT_FILE = "E2E_decode_kernel_95th.json"
+    
+    if 'p95_duration' in stats:
+        # Load existing data or initialize
+        try:
+            with open(P95_OUTPUT_FILE, 'r') as f:
+                output_data = json.load(f)
+            if not isinstance(output_data, dict):
+                 # Handle case where file is corrupted or not a dict
+                output_data = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            output_data = {}
+
+        # Use the input file path as the key and the P95 duration as the value
+        output_data[file_path] = stats['p95_duration']
+        
+        # Save the updated data back to the JSON file
+        try:
+            with open(P95_OUTPUT_FILE, 'w') as f:
+                json.dump(output_data, f, indent=4)
+            print(f"\n✅ Successfully saved P95 duration to '{P95_OUTPUT_FILE}' under key: '{file_path}'.")
+        except IOError as e:
+             print(f"Error: Could not write to output JSON file '{P95_OUTPUT_FILE}': {e}", file=sys.stderr)
+    
+    # Print a sample of the durations (optional, removed the full list print for brevity)
+    if 'total_count' in stats and stats['total_count'] > 0:
+        # Note: To print the actual durations, you would need to return the list 
+        # from find_kernel_durations, but the current design returns only stats.
+        print(f"\n{target_name} analysis complete. Total samples: {stats['total_count']}.")

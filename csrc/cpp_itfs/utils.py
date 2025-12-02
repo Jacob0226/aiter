@@ -14,6 +14,7 @@ import binascii
 import hashlib
 import logging
 import time
+import json
 
 
 logger = logging.getLogger("aiter")
@@ -275,26 +276,6 @@ def compile_template_op(
         folder = func_name
 
     if not_built(folder):
-        # --------------------- Debug -------------------------
-        print(f"[aiter utils.py] this template is not built")
-        if kwargs:
-            for key, value in kwargs.items():
-                print(f"Key: {key}, Value: {value}")
-        debug_data = {
-            "folder": folder,
-            "kwargs": dict(kwargs) 
-        }
-        log_filename = os.path.join(folder, "aiter_compile_debug_info.json")
-        try:
-            # Write the debug information to a JSON file
-            with open(log_filename, 'w') as f:
-                json.dump(debug_data, f, indent=4)
-            print(f"[aiter utils.py] Debug info (folder and kwargs) saved to {log_filename}")
-        except Exception as e:
-            # Catch potential errors during file writing
-            print(f"[aiter utils.py] ERROR: Failed to save JSON debug info: {e}")
-        # ------------------ End of Debug -------------------------
-
         if includes is None:
             includes = []
         if sources is None:
@@ -305,6 +286,26 @@ def compile_template_op(
             logger.info(f"compile_template_op {func_name = } with {locals()}...")
         src_file = src_template.render(func_name=func_name, **kwargs)
         compile_lib(src_file, folder, includes, sources, cxxflags)
+
+        # --------------------- Debug -------------------------
+        print(f"[aiter utils.py] this template is not built")
+        if kwargs:
+            for key, value in kwargs.items():
+                print(f"Key: {key}, Value: {value}")
+        debug_data = {
+            "folder": folder,
+            "kwargs": dict(kwargs) 
+        }
+        log_filename = os.path.join(BUILD_DIR, folder, "aiter_compile_debug_info.json")
+        try:
+            # Write the debug information to a JSON file
+            with open(log_filename, 'w') as f:
+                json.dump(debug_data, f, indent=4)
+            print(f"[aiter utils.py] Debug info (folder and kwargs) saved to {log_filename}")
+        except Exception as e:
+            # Catch potential errors during file writing
+            print(f"[aiter utils.py] ERROR: Failed to save JSON debug info: {e}")
+        # ------------------ End of Debug -------------------------
     return run_lib(func_name, folder)
 
 
