@@ -339,7 +339,7 @@ def test_paged_attention(
             _, _ = run_aiter(*ARGS_TUPLE, version='GOLDEN')
             _, _ = run_aiter(*ARGS_TUPLE, version='EXPERIMENTAL')
 
-        print(f"[DEBUG] Profile {enable_profile}\n\n")
+        print(f"[DEBUG] RPD Profile\n")
         profile = rpdTracerControl() 
         profile.start()
         profile.start() # Not sure why need 2 profile.start() to capture the traces
@@ -498,7 +498,7 @@ if __name__ == "__main__":
         args.warmup = 5
     # print(f"[DEBUG pa_unit_test.py] ctx_len={ctx_len}, pa_variant={pa_variant}, quant_cache_dtype={quant_cache_dtype}")
     if args.enable_profile:
-        rpdTracerControl.setFilename(name = "trace_GOLDEN.rpd", append=False)
+        rpdTracerControl.setFilename(name = "trace_UT.rpd", append=False)
         profile = rpdTracerControl() 
 
     page_size = args.page_size # Original block size is 1

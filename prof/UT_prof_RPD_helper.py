@@ -3,11 +3,13 @@ import argparse
 import sys
 import json
 import os
+import re
 from typing import Dict, Any, Optional
 
 def extract_kernel_stats(file_path: str, kernel_name_fragment: str) -> Dict[str, Any]:
     """
-    Finds TotalCalls and TotalDuration_us for a specific kernel function in a CSV file.
+    Finds TotalCalls, TotalDuration_us, and Ave_us for a specific kernel 
+    function in a CSV file where the kernel name contains the fragment.
     """
     stats = {}
     try:
@@ -26,23 +28,33 @@ def extract_kernel_stats(file_path: str, kernel_name_fragment: str) -> Dict[str,
                 name_idx = header.index("Name")
                 calls_idx = header.index("TotalCalls")
                 duration_idx = header.index("TotalDuration_us")
-            except ValueError:
-                print(f"Error: CSV header in file {file_path} must contain 'Name', 'TotalCalls', and 'TotalDuration_us'.", file=sys.stderr)
+                # Modified to look for Ave_us as required by the prompt
+                ave_us_idx = header.index("Ave_us") 
+            except ValueError as e:
+                print(f"Error: CSV header in file {file_path} must contain 'Name', 'TotalCalls', 'TotalDuration_us', and 'Ave_us'. Missing: {e}", file=sys.stderr)
                 return stats
 
             # Iterate through data rows
             for row in reader:
-                if len(row) > max(name_idx, calls_idx, duration_idx):
+                if len(row) > max(name_idx, calls_idx, duration_idx, ave_us_idx):
                     name = row[name_idx]
                     
                     # Check if the name contains the target fragment
                     if kernel_name_fragment in name:
+                        # Only return the required Ave_us and name for the main logic
                         stats = {
+                            "Name": name,
+                            "Ave_us": row[ave_us_idx],
                             "TotalCalls": row[calls_idx],
                             "TotalDuration_us": row[duration_idx],
                             "SourceFile": file_path
                         }
-                        return stats # Return immediately upon finding the kernel
+                        # We don't return immediately here, as the main function 
+                        # will call this function twice with different fragments ('<0' and '<1').
+                        # The original function *did* return immediately, but for 
+                        # the new requirement, we need to adapt the calling logic in main.
+                        # For simplicity, let's keep the return as is, and adjust main.
+                        return stats 
                         
     except FileNotFoundError:
         print(f"Error: File not found at {file_path}", file=sys.stderr)
@@ -75,89 +87,92 @@ def save_json(file_path: str, data: Dict[str, Any]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compares TotalCalls and TotalDuration_us for a specific kernel function across two RPD trace CSV files.",
+        description="Extracts and compares Ave_us for GOLDEN (kernel<0) and EXPERIMENTAL (kernel<1) kernels from an RPD trace CSV file.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
-    # Define two required CSV file arguments
+    # Define the required CSV file argument
     parser.add_argument(
-        '--warmup-csv', 
+        '--csv', 
         type=str, 
-        help="Path to the first CSV file which only runs warmup."
-    )
-    parser.add_argument(
-        '--allruns-csv', 
-        type=str, 
-        help="Path to the second CSV file which runs all runs"
+        required=True, # Added required=True
+        help="Path to the CSV file which records rpd kernels."
     )
     
-    # Define optional kernel name fragment argument
+    # Define optional base kernel name fragment argument
     parser.add_argument(
         '-k', '--kernel', 
         type=str, 
         default="paged_attention_ll4mi_QKV_mfma16_kernel",
-        help="Fragment of the kernel function name to look up.\n(Default: paged_attention_ll4mi_QKV_mfma16_kernel)"
+        help="Base fragment of the kernel function name to look up (e.g., 'paged_attention_...').\n(Default: paged_attention_ll4mi_QKV_mfma16_kernel)"
     )
 
     args = parser.parse_args()
 
-    kernel_fragment = args.kernel
+    base_kernel_fragment = args.kernel
+    csv_path = args.csv
     
-    # Execute extraction
-    stats1 = extract_kernel_stats(args.allruns_csv, kernel_fragment)
-    stats2 = extract_kernel_stats(args.warmup_csv, kernel_fragment)
+    # 1. Extract GOLDEN (kernel<0) stats
+    golden_fragment = f"{base_kernel_fragment}<0"
+    golden_stats = extract_kernel_stats(csv_path, golden_fragment)
 
-    # Output results
-    print(f"--- Kernel: {kernel_fragment} Comparison Report ---\n")
-
-    def print_stats(stats: Dict[str, Any], label: str):
-        print(f"--- {label} ({stats.get('SourceFile', 'File not found')}) ---")
-        if stats:
-            print(f"TotalCalls:       {stats.get('TotalCalls')}")
-            print(f"TotalDuration_us: {stats.get('TotalDuration_us')}")
-        else:
-            print("Target kernel statistics not found.")
-
-    print_stats(stats1, "File 1")
-    print()
-    print_stats(stats2, "File 2")
-
-    # Perform comparison
-    if stats1 and stats2:
-        try:
-            calls_allruns = int(stats1.get('TotalCalls'))
-            calls_warmup  = int(stats2.get('TotalCalls'))
-            duration1 = float(stats1.get('TotalDuration_us'))
-            duration2 = float(stats2.get('TotalDuration_us'))
-            assert calls_allruns > calls_warmup
-            duration_diff = duration1 - duration2
-            calls_diff    = calls_allruns - calls_warmup
-            
-            cold_run_avg = duration_diff/calls_diff
-            print(f"Avg of cold run is: {cold_run_avg}us.")
-                
-        except ValueError:
-            print("\nError: Could not compare durations, as data is not valid floating point numbers.", file=sys.stderr)
-        except AssertionError as e:
-            print(f"\nFATAL ASSERTION: {e}", file=sys.stderr)
-            sys.exit(1)
+    # 2. Extract EXPERIMENTAL (kernel<1) stats
+    experimental_fragment = f"{base_kernel_fragment}<1"
+    experimental_stats = extract_kernel_stats(csv_path, experimental_fragment)
     
-    # Save to json:
-    summary_file = load_json("decode_rpd_runtime.json")
-    allruns_basename = os.path.basename(args.allruns_csv)
-    key = allruns_basename.replace('trace_', '').replace('_AllRuns.csv', '')
-    summary_file[key] = cold_run_avg
-    save_json("decode_rpd_runtime.json", summary_file)
-    print(f"Result saved to decode_rpd_runtime.json under key: {key}")
+    result_data = {
+        "GOLDEN": None,
+        "EXPERIMENTAL": None
+    }
+    
+    # 3. Print Results
+    print(f"\n✨ Kernel Analysis for CSV: **{os.path.basename(csv_path)}**")
+    print("-" * 30)
+
+    if golden_stats:
+        golden_ave_us = golden_stats.get("Ave_us")
+        print(f"**GOLDEN** ({golden_fragment}): **Ave_us = {golden_ave_us}** (Calls: {golden_stats.get('TotalCalls', 'N/A')}, Duration: {golden_stats.get('TotalDuration_us', 'N/A')} us)")
+        result_data["GOLDEN"] = golden_ave_us
+    else:
+        print(f"**GOLDEN** ({golden_fragment}): Not found.")
+
+    if experimental_stats:
+        experimental_ave_us = experimental_stats.get("Ave_us")
+        print(f"**EXPERIMENTAL** ({experimental_fragment}): **Ave_us = {experimental_ave_us}** (Calls: {experimental_stats.get('TotalCalls', 'N/A')}, Duration: {experimental_stats.get('TotalDuration_us', 'N/A')} us)")
+        result_data["EXPERIMENTAL"] = experimental_ave_us
+    else:
+        print(f"**EXPERIMENTAL** ({experimental_fragment}): Not found.")
+        
+    # 4. Save to json
+    summary_file_path = "UT_rpd.json" # Changed filename to UT_rpd.json as requested
+    summary_data = load_json(summary_file_path)
+    
+    # Create the key from the CSV filename (e.g., 'trace_PS1_BS512_ILEN256_GOLDEN.csv' -> 'trace_PS1_BS512_ILEN256_GOLDEN.csv_Ave_us')
+    pattern = r'PS(\d+)_BS(\d+)_ILEN(\d+)'
+    match = re.search(pattern, csv_path)
+    if match:
+        ps_value = str(match.group(1))
+        bs_value = str(match.group(2))
+        ilen_value = str(match.group(3))
+    else:
+        print("[ERROR] csv-path cannot be parsed.")
+        return
+    PS_Key = f"PS{ps_value}"
+    key = f"BS{bs_value}_ILEN{ilen_value}" + "_Ave_us" 
+    if PS_Key not in summary_data:
+        summary_data[PS_Key] = {}  # Initialize the nested dictionary
+
+    # Save the extracted data
+    if result_data["GOLDEN"] is not None or result_data["EXPERIMENTAL"] is not None:
+        summary_data[PS_Key][key] = {
+            "GOLDEN": result_data["GOLDEN"],
+            "EXPERIMENTAL": result_data["EXPERIMENTAL"]
+        }
+        save_json(summary_file_path, summary_data)
+        print(f"\n✅ Result saved to **{summary_file_path}** under key: **{key}**")
+    else:
+        print("\n⚠️ No kernel data found. Skipping JSON save.")
+
 
 if __name__ == "__main__":
     main()
-
-
-'''
-Example:
-python ~/PR/aiter/prof/UT_prof_RPD_helper.py \
-        --warmup-csv   trace_PS1_BS512_ILEN256_GOLDEN_WARMUP.csv \
-        --allruns-csv  trace_PS1_BS512_ILEN256_GOLDEN_AllRuns.csv
-
-'''
