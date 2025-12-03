@@ -27,6 +27,19 @@ def compile(
 ):
     import os
     version = os.getenv('QKV_VERSION', 'GOLDEN')
+    if version == "EXPERIMENTAL":
+        if head_size != 128 or kv_dtype != "__hip_bfloat16":
+            print(
+                f"EXPERIMENTAL pa_ragged kernel requires head_size=128 and kv_dtype=bf16. Shut down. " # Fallback to original kernel
+                f"head_size={head_size}, kv_dtype={kv_dtype}"
+            )
+            exit(0)
+            version = "GOLDEN"
+    # print(
+    #     f"[DEBUG], "
+    #     f"head_size={head_size}, kv_dtype={kv_dtype}"
+    # )
+    # exit(0)
 
     return compile_template_op(
         src_template,
