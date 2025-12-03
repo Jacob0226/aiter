@@ -14,6 +14,12 @@ import os
 import numpy as np
 from aiter import paged_attention_ragged
 from rpdTracerControl import rpdTracerControl
+has_icache_flush = False
+try:
+    import icache_module
+    has_icache_flush = True
+except ImportError as e:
+    print(f"Cannot import icache_module. {e}")
 
 uniform_range = (-1, 1)
 class PAVariant(Enum):
@@ -150,6 +156,11 @@ def run_aiter(
     _PARTITION_SIZE_ROCM,
     version="GOLDEN",
 ):
+    if has_icache_flush:
+        icache_module.flush_icache()
+    else:
+        print(f"[DEBUG] No icache flushing")
+        
     os.environ['QKV_VERSION'] = version
     torch.ops.aiter.paged_attention_ragged(
         output,
