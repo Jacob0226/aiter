@@ -164,7 +164,7 @@ def main():
         bs_value = str(match.group(1))
         ilen_value = str(match.group(2))
         olen_value = str(match.group(3))
-        ps_value = str(match.group(3))
+        ps_value = str(match.group(4))
         
         PS_Key = f"PS{ps_value}"
         key = f"BS{bs_value}_ILEN{ilen_value}_OLEN{olen_value}" + "_Ave_us" 
