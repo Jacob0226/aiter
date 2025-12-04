@@ -10,7 +10,8 @@ from itertools import product
 PAGE_SIZES = [1, 16]
 BS = [1024, 512, 128, 16]      # Batch Size                          [1024, 512, 128, 16] 
 CL = [256, 512, 1024, 2048, 4096] # Prefill Length (Context Length)  [256, 512, 1024, 4096]
-WARM_UP = 3
+WARM_UP = 30
+ITERS = 30
 
 # Determine HOME directory dynamically
 HOME_DIR = os.path.expanduser("~")
@@ -25,7 +26,7 @@ DISPATCH_ID_REGEX = r'^\s*│\s*\d+\s*│\s*(\d+)\s*│'
 
 # --- Utility Functions ---
 
-def run_command(cmd, log_output=True, check_success=True, capture=False):
+def run_command(cmd, log_output=True, check_success=True, capture=False, env=None):
     """
     Executes an external command using subprocess.
     All execution logs are printed to sys.stderr.
@@ -42,7 +43,8 @@ def run_command(cmd, log_output=True, check_success=True, capture=False):
                 capture_output=True,
                 text=True,
                 check=check_success,
-                encoding='utf-8'
+                encoding='utf-8',
+                env=env
             )
             return result.stdout
         else:
@@ -155,11 +157,16 @@ def main():
                     # 2. Run Profiling
                     if os.path.exists(dispatch_log)==False:
                         cmd_profile = [
-                            "rocprof-compute", "profile", "-n", OUT, "--no-roof",
-                            "--", "python", UT_SCRIPT, 
-                            "-n", str(bs), "-c", str(cl), "--warmup", str(WARM_UP), "--page-size", str(ps)
+                            "rocprof-compute", "profile", "-n", OUT, #"--no-roof",
+                            "--", "python", UT_SCRIPT, "-n", str(bs), "-c", str(cl), 
+                            "--warmup", str(WARM_UP), "--num-iters", str(ITERS),
+                            "--page-size", str(ps)
                         ]
-                        run_command(cmd_profile, check_success=True, capture=False)
+
+                        env_vars = os.environ.copy()
+                        env_vars["HIP_VISIBLE_DEVICES"] = "5"
+
+                        run_command(cmd_profile, env=env_vars, check_success=True, capture=False)
                     else:
                         print(f"{dispatch_log} already exists. Skip profile. Go to analyze step.")
 
@@ -237,3 +244,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n[GLOBAL ERROR] Script failed during initialization: {e}", file=sys.stderr)
         sys.exit(1)
+
+        
