@@ -55,6 +55,7 @@ def run_command(cmd, log_output=True, check_success=True, capture=False, env=Non
                 check=check_success,
                 stdout=sys.stderr, # Redirect profile's stdout to stderr
                 stderr=sys.stderr, # Redirect profile's stderr to stderr
+                env=env
             )
             return None
 
@@ -177,7 +178,7 @@ def main():
                     list_stats_output = run_command(cmd_list_stats, check_success=True, capture=True)
                     with open(dispatch_log, 'w') as f:
                          f.write(list_stats_output)
-                    print(f"[LOG] Log saved to {dispatch_log}", file=sys.stderr)
+                    print(f"    [LOG] Log saved to {dispatch_log}", file=sys.stderr)
 
 
                     # 4. Find Dispatch IDs
@@ -185,11 +186,11 @@ def main():
                     experiment_id = find_dispatch_id(list_stats_output, SEARCH_STRING_EXPERIMENT)
 
                     if golden_id is None or experiment_id is None:
-                        print(f"[ERROR] ID not found for: {config_name}", file=sys.stderr)
+                        print(f"    [ERROR] ID not found for: {config_name}", file=sys.stderr)
                         csv_file.write(f"{ps},{bs},ilen-{cl},N/A,N/A,N/A\n")
                         continue
                     
-                    print(f"[{config_name}] Found IDs: Golden={golden_id}, Exp={experiment_id}", file=sys.stderr)
+                    print(f"    [{config_name}] Found IDs: Golden={golden_id}, Exp={experiment_id}", file=sys.stderr)
                     
                     # 5. Analyze Golden ID
                     cmd_golden_analyze = [
