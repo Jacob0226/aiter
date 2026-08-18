@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -1564,6 +1565,298 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
 
     const float k_inv_scale = 1.0f / k_scale;
     kv_cache[dst_offset] = opus::cast<cache_t>(normed[dim] * k_inv_scale);
+}
+
+// Wide variant of indexer_qk_rope_quant_and_cache_kernel.
+//
+// The kernel above gives every (token, head) row its own 128-thread workgroup
+// and every thread a single bf16. At decode widths that is the right shape --
+// there are only a few hundred rows and the cost is launch latency -- but at
+// prefill widths it means hundreds of thousands of two-wave workgroups, each
+// moving 128 B per memory instruction and paying an LDS round trip plus a
+// barrier for reductions that only span 128 lanes.
+//
+// Here each lane owns VEC contiguous elements, so a row fits in HEAD_DIM / VEC
+// lanes and its reductions collapse to a shuffle butterfly inside one wave: no
+// LDS, no __syncthreads. One workgroup covers ROWS_PER_BLOCK rows, cutting the
+// grid by the same factor. Q rows and K rows are laid out back to back along
+// blockIdx.x so this is still a single launch; the legacy kernel folded K into
+// the head 0 workgroup, which left the other n_heads-1 doing nothing for it.
+//
+// Reductions stay numerically identical for q (max is order independent), while
+// the k LayerNorm sums in a different order and can land one fp8 ulp away.
+template <int LANES>
+__device__ __forceinline__ float row_reduce_max(float v)
+{
+#pragma unroll
+    for(int off = 1; off < LANES; off <<= 1)
+        v = fmaxf(v, __shfl_xor(v, off));
+    return v;
+}
+
+template <int LANES>
+__device__ __forceinline__ float row_reduce_sum(float v)
+{
+#pragma unroll
+    for(int off = 1; off < LANES; off <<= 1)
+        v += __shfl_xor(v, off);
+    return v;
+}
+
+template <typename scalar_t, int VEC>
+struct alignas(sizeof(scalar_t) * VEC) InVec
+{
+    scalar_t data[VEC];
+};
+
+template <typename cache_t, int VEC>
+struct alignas(sizeof(cache_t) * VEC) OutVec
+{
+    cache_t data[VEC];
+};
+
+// Rotate the VEC values a lane holds, given its first dim. Only lanes whose
+// dims fall below ROPE_DIM call this. For the interleaved (non-neox) layout the
+// (2i, 2i+1) partner is always inside the same lane; for neox the partner is
+// dim +/- ROPE_DIM/2, which is exactly LANES_ROPE/2 lanes away, so one shuffle
+// of the packed vector fetches it.
+template <typename scalar_t, int VEC, int ROPE_DIM>
+__device__ __forceinline__ void rope_lane(float (&vals)[VEC],
+                                          const scalar_t* __restrict__ cos_ptr,
+                                          const scalar_t* __restrict__ sin_ptr,
+                                          const int d0,
+                                          const bool is_neox)
+{
+    float rotated[VEC];
+    if(is_neox)
+    {
+        constexpr int HALF = ROPE_DIM / 2;
+        float partner[VEC];
+#pragma unroll
+        for(int e = 0; e < VEC; ++e)
+            partner[e] = __shfl_xor(vals[e], HALF / VEC);
+        const bool lower = d0 < HALF;
+        const int cos_base = lower ? d0 : d0 - HALF;
+#pragma unroll
+        for(int e = 0; e < VEC; ++e)
+        {
+            const float c = static_cast<float>(cos_ptr[cos_base + e]);
+            const float s = static_cast<float>(sin_ptr[cos_base + e]);
+            rotated[e] = lower ? (vals[e] * c - partner[e] * s)
+                               : (vals[e] * c + partner[e] * s);
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int e = 0; e < VEC; ++e)
+        {
+            const int cos_idx = (d0 + e) / 2;
+            const float c = static_cast<float>(cos_ptr[cos_idx]);
+            const float s = static_cast<float>(sin_ptr[cos_idx]);
+            const float pair = ((d0 + e) % 2 == 0) ? vals[e + 1] : vals[e - 1];
+            rotated[e] = ((d0 + e) % 2 == 0) ? (vals[e] * c - pair * s)
+                                             : (vals[e] * c + pair * s);
+        }
+    }
+#pragma unroll
+    for(int e = 0; e < VEC; ++e)
+        // Match the split path, which materializes the rotated half in the
+        // input dtype before quantizing.
+        vals[e] = static_cast<float>(static_cast<scalar_t>(rotated[e]));
+}
+
+template <typename scalar_t,
+          typename cache_t,
+          vllm::Fp8KVCacheDataType kv_dt,
+          int HEAD_DIM,
+          int ROPE_DIM,
+          int VEC,
+          int ROWS_PER_BLOCK>
+__global__ void indexer_qk_rope_quant_and_cache_wide_kernel(
+    const scalar_t* __restrict__ q,
+    cache_t* __restrict__ q_out,
+    const scalar_t* __restrict__ weights,
+    float* __restrict__ weights_out,
+    const scalar_t* __restrict__ k,
+    cache_t* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping,
+    const float* __restrict__ norm_weight,
+    const float* __restrict__ norm_bias,
+    const int64_t* __restrict__ positions,
+    const scalar_t* __restrict__ cos_cache,
+    const scalar_t* __restrict__ sin_cache,
+    const int num_tokens,
+    const int n_heads,
+    const int quant_block_size,
+    const int cache_block_size,
+    const int cache_stride,
+    const int64_t q_stride_t,
+    const int64_t q_stride_h,
+    const int64_t q_out_stride_t,
+    const int64_t q_out_stride_h,
+    const int64_t weights_stride_t,
+    const int64_t weights_stride_h,
+    const int64_t weights_out_stride_t,
+    const int64_t weights_out_stride_h,
+    const int64_t k_stride_t,
+    const int64_t cos_stride0,
+    const int64_t sin_stride0,
+    const int q_blocks,
+    const float epsilon,
+    const float weights_scale,
+    const bool use_ue8m0,
+    const bool preshuffle,
+    const bool is_neox)
+{
+    static_assert(HEAD_DIM % VEC == 0, "HEAD_DIM must be a multiple of VEC");
+    constexpr int LANES = HEAD_DIM / VEC;
+    static_assert(ROPE_DIM % VEC == 0, "ROPE_DIM must be a multiple of VEC");
+
+    using in_vec_t  = InVec<scalar_t, VEC>;
+    using out_vec_t = OutVec<cache_t, VEC>;
+
+    const int lane_in_row  = threadIdx.x % LANES;
+    const int row_in_block = threadIdx.x / LANES;
+    const int d0           = lane_in_row * VEC;
+    const float fp8_max    = static_cast<float>(opus::finfo<cache_t>::max());
+
+    float vals[VEC];
+
+    if(blockIdx.x < q_blocks)
+    {
+        const int64_t row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_BLOCK + row_in_block;
+        if(row >= static_cast<int64_t>(num_tokens) * n_heads)
+            return;
+        const int64_t token_idx = row / n_heads;
+        const int head_idx      = static_cast<int>(row - token_idx * n_heads);
+        if(slot_mapping[token_idx] < 0)
+            return;
+
+        const in_vec_t v = *reinterpret_cast<const in_vec_t*>(
+            q + token_idx * q_stride_t + head_idx * q_stride_h + d0);
+#pragma unroll
+        for(int e = 0; e < VEC; ++e)
+            vals[e] = static_cast<float>(v.data[e]);
+
+        if(d0 < ROPE_DIM)
+        {
+            const int64_t pos = positions[token_idx];
+            rope_lane<scalar_t, VEC, ROPE_DIM>(
+                vals, cos_cache + pos * cos_stride0, sin_cache + pos * sin_stride0, d0, is_neox);
+        }
+
+        float amax = 0.0f;
+#pragma unroll
+        for(int e = 0; e < VEC; ++e)
+            amax = fmaxf(amax, fabsf(vals[e]));
+        amax = row_reduce_max<LANES>(amax);
+
+        float scale = fmaxf(amax, 1e-10f) * (1.0f / fp8_max);
+        if(use_ue8m0)
+            scale = exp2f(ceilf(log2f(scale)));
+        const float inv_scale = 1.0f / scale;
+
+        out_vec_t o;
+#pragma unroll
+        for(int e = 0; e < VEC; ++e)
+            o.data[e] = opus::cast<cache_t>(vals[e] * inv_scale);
+        *reinterpret_cast<out_vec_t*>(q_out + token_idx * q_out_stride_t +
+                                      head_idx * q_out_stride_h + d0) = o;
+
+        if(lane_in_row == 0)
+        {
+            const float w = static_cast<float>(
+                weights[token_idx * weights_stride_t + head_idx * weights_stride_h]);
+            weights_out[token_idx * weights_out_stride_t +
+                        head_idx * weights_out_stride_h] = w * scale * weights_scale;
+        }
+        return;
+    }
+
+    const int64_t token_idx =
+        static_cast<int64_t>(blockIdx.x - q_blocks) * ROWS_PER_BLOCK + row_in_block;
+    if(token_idx >= num_tokens)
+        return;
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if(slot_idx < 0)
+        return;
+
+    const in_vec_t v = *reinterpret_cast<const in_vec_t*>(k + token_idx * k_stride_t + d0);
+#pragma unroll
+    for(int e = 0; e < VEC; ++e)
+        vals[e] = static_cast<float>(v.data[e]);
+
+    float sum = 0.0f;
+#pragma unroll
+    for(int e = 0; e < VEC; ++e)
+        sum += vals[e];
+    const float mean = row_reduce_sum<LANES>(sum) / static_cast<float>(HEAD_DIM);
+
+    float ss = 0.0f;
+#pragma unroll
+    for(int e = 0; e < VEC; ++e)
+    {
+        vals[e] -= mean;
+        ss += vals[e] * vals[e];
+    }
+    const float inv_std =
+        rsqrtf(row_reduce_sum<LANES>(ss) / static_cast<float>(HEAD_DIM) + epsilon);
+
+#pragma unroll
+    for(int e = 0; e < VEC; ++e)
+        vals[e] = static_cast<float>(
+            static_cast<scalar_t>(vals[e] * inv_std * norm_weight[d0 + e] + norm_bias[d0 + e]));
+
+    if(d0 < ROPE_DIM)
+    {
+        const int64_t pos = positions[token_idx];
+        rope_lane<scalar_t, VEC, ROPE_DIM>(
+            vals, cos_cache + pos * cos_stride0, sin_cache + pos * sin_stride0, d0, is_neox);
+    }
+
+    float amax = 0.0f;
+#pragma unroll
+    for(int e = 0; e < VEC; ++e)
+        amax = fmaxf(amax, fabsf(vals[e]));
+    amax = row_reduce_max<LANES>(amax);
+
+    float k_scale = fmaxf(amax, 1e-4f) / fp8_max;
+    if(use_ue8m0)
+        k_scale = exp2f(ceilf(log2f(k_scale)));
+
+    const int64_t block_idx    = slot_idx / cache_block_size;
+    const int64_t block_offset = slot_idx % cache_block_size;
+    const int64_t block_base   = block_idx * cache_block_size * cache_stride;
+    int64_t dst_offset;
+    if(preshuffle)
+    {
+        // The 16x16 MFMA tiling keeps a lane's VEC dims inside one column tile
+        // as long as VEC divides the tile, so this stays a single vector store.
+        constexpr int TILE      = 16;
+        const int token_tile_id = block_offset / TILE;
+        const int token_in_tile = block_offset % TILE;
+        dst_offset = block_base + token_tile_id * (TILE * HEAD_DIM) +
+                     (d0 / TILE) * (TILE * TILE) + token_in_tile * TILE + (d0 % TILE);
+    }
+    else
+    {
+        dst_offset = block_base + block_offset * HEAD_DIM + d0;
+    }
+
+    if(lane_in_row == 0)
+    {
+        const int64_t dst_scale_idx =
+            block_base + cache_block_size * HEAD_DIM + block_offset * HEAD_DIM * 4 / quant_block_size;
+        reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = k_scale;
+    }
+
+    const float k_inv_scale = 1.0f / k_scale;
+    out_vec_t o;
+#pragma unroll
+    for(int e = 0; e < VEC; ++e)
+        o.data[e] = opus::cast<cache_t>(vals[e] * k_inv_scale);
+    *reinterpret_cast<out_vec_t*>(kv_cache + dst_offset) = o;
 }
 
 template <int BLOCK_X_SIZE, int BLOCK_Y_SIZE>
@@ -3513,6 +3806,65 @@ void reshape_and_cache_flash(
                                      do_preshuffle,                                               \
                                      is_neox);
 
+// Rows per workgroup for the wide indexer q/k kernel. With VEC=8 a 128-wide row
+// spans 16 lanes, so 16 rows fill a 256-thread workgroup and every row's
+// reductions stay inside one wave.
+#define INDEXER_QK_WIDE_ROWS 16
+
+// Escape hatch: forces the one-row-per-workgroup kernel so the two geometries
+// can be compared on the same build.
+static bool indexer_qk_wide_disabled()
+{
+    static const bool value = [] {
+        const char* s = std::getenv("AITER_INDEXER_QK_DISABLE_WIDE");
+        return s != nullptr && s[0] != '\0' && s[0] != '0';
+    }();
+    return value;
+}
+
+#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_WIDE(KV_T, CACHE_T, KV_DTYPE)                        \
+    aiter::indexer_qk_rope_quant_and_cache_wide_kernel<KV_T,                                      \
+                                                       CACHE_T,                                   \
+                                                       KV_DTYPE,                                   \
+                                                       128,                                        \
+                                                       64,                                         \
+                                                       WIDE_VEC,                                    \
+                                                       INDEXER_QK_WIDE_ROWS>                        \
+        <<<wide_grid, wide_block, 0, stream>>>(reinterpret_cast<KV_T*>(q.data_ptr()),              \
+                                               reinterpret_cast<CACHE_T*>(q_out.data_ptr()),      \
+                                               reinterpret_cast<KV_T*>(weights.data_ptr()),       \
+                                               reinterpret_cast<float*>(weights_out.data_ptr()),  \
+                                               reinterpret_cast<KV_T*>(k.data_ptr()),             \
+                                               reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),   \
+                                               reinterpret_cast<int64_t*>(slot_mapping.data_ptr()), \
+                                               reinterpret_cast<float*>(norm_weight.data_ptr()),  \
+                                               reinterpret_cast<float*>(norm_bias.data_ptr()),    \
+                                               reinterpret_cast<int64_t*>(positions.data_ptr()),  \
+                                               reinterpret_cast<KV_T*>(cos_cache.data_ptr()),     \
+                                               reinterpret_cast<KV_T*>(sin_cache.data_ptr()),     \
+                                               num_tokens,                                        \
+                                               n_heads,                                           \
+                                               quant_block_size,                                  \
+                                               cache_block_size,                                  \
+                                               cache_stride,                                      \
+                                               q.stride(0),                                       \
+                                               q.stride(1),                                       \
+                                               q_out.stride(0),                                   \
+                                               q_out.stride(1),                                   \
+                                               weights.stride(0),                                 \
+                                               weights.stride(1),                                 \
+                                               weights_out.stride(0),                             \
+                                               weights_out.stride(1),                             \
+                                               k.stride(0),                                       \
+                                               cos_cache.stride(0),                               \
+                                               sin_cache.stride(0),                               \
+                                               q_blocks,                                          \
+                                               eps,                                               \
+                                               w_scale,                                           \
+                                               use_ue8m0,                                         \
+                                               do_preshuffle,                                     \
+                                               is_neox);
+
 #define CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(BLOCK_Y_SIZE)          \
     aiter::cp_gather_indexer_k_quant_cache_kernel<8, BLOCK_Y_SIZE>  \
         <<<dim3((num_tokens + BLOCK_Y_SIZE - 1) / BLOCK_Y_SIZE,     \
@@ -4084,13 +4436,57 @@ void indexer_qk_rope_quant_and_cache(
                     head_dim);
     }
 
-    dim3 grid(num_tokens, n_heads);
-    dim3 block(head_dim);
     HipDeviceGuard device_guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     float eps = static_cast<float>(epsilon);
     float w_scale = static_cast<float>(weights_scale);
 
+    // The wide kernel gives each lane VEC contiguous elements, so every row it
+    // touches has to be unit stride and start on a VEC boundary. The paged cache
+    // store is the tightest constraint: it lands at block_offset * head_dim
+    // inside a block of cache_block_size * cache_stride bytes, and cache_stride
+    // carries 4 extra bytes for the scale, so a page size of 1 leaves the row
+    // start 4 bytes short of an 8-element boundary. VEC=4 still fits there.
+    const int64_t total_rows = static_cast<int64_t>(num_tokens) * n_heads;
+    const auto vec_fits = [&](int vec) {
+        return q.stride(0) % vec == 0 && q.stride(1) % vec == 0 &&
+               q_out.stride(0) % vec == 0 && q_out.stride(1) % vec == 0 &&
+               k.stride(0) % vec == 0 &&
+               (static_cast<int64_t>(cache_block_size) * cache_stride) % vec == 0;
+    };
+    const bool rows_contiguous =
+        q.stride(2) == 1 && q_out.stride(2) == 1 && k.stride(1) == 1 &&
+        reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(q_out.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(kv_cache.data_ptr()) % 16 == 0;
+
+    if(rows_contiguous && !indexer_qk_wide_disabled())
+    {
+        const int k_blocks = (num_tokens + INDEXER_QK_WIDE_ROWS - 1) / INDEXER_QK_WIDE_ROWS;
+        const int q_blocks =
+            static_cast<int>((total_rows + INDEXER_QK_WIDE_ROWS - 1) / INDEXER_QK_WIDE_ROWS);
+        dim3 wide_grid(q_blocks + k_blocks);
+        if(vec_fits(8))
+        {
+            constexpr int WIDE_VEC = 8;
+            dim3 wide_block(INDEXER_QK_WIDE_ROWS * (128 / WIDE_VEC));
+            DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(
+                k.dtype(), "fp8_e4m3", CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_WIDE);
+            return;
+        }
+        if(vec_fits(4))
+        {
+            constexpr int WIDE_VEC = 4;
+            dim3 wide_block(INDEXER_QK_WIDE_ROWS * (128 / WIDE_VEC));
+            DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(
+                k.dtype(), "fp8_e4m3", CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_WIDE);
+            return;
+        }
+    }
+
+    dim3 grid(num_tokens, n_heads);
+    dim3 block(head_dim);
     DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(k.dtype(),
                                             "fp8_e4m3",
                                             CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE);
