@@ -264,7 +264,9 @@ def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
         )
         for block_size in (16, 32, 64, 128):
             # Other shapes go to the fused aux sort, which has no instance for them.
-            if not fm._aux_uses_opus(fm.AUX_SORT_OPUS, block_size, token * topk, E):
+            if not fm._aux_uses_opus(
+                fm.AUX_SORT_OPUS, block_size, token * topk, E, token
+            ):
                 continue
             ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
             out = moe_sorting(

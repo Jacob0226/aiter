@@ -107,7 +107,9 @@ class AsmMoeMode(IntEnum):
         return self is AsmMoeMode.SORTED or self is AsmMoeMode.POST_REDUCE
 
 
-def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
+def _aux_uses_opus(
+    output_aux, block_size, routed_rows=None, num_experts=None, tokens=None
+):
     """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
 
     block_size 16 has no three-stage sort instance -- codegen emits `aux_sort3s_*`
@@ -117,11 +119,12 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
     the routed rows are few relative to the experts and loses linearly after,
     which is why block_size 16 was originally pinned away from Opus wholesale.
 
-    Switch on which side of that crossover we are: routed_rows >= num_experts is
-    "at least one routed row per expert on average". Measured on kimi-k3 a4w4
-    (NE=896, topk=16, gfx950) the prologue crosses between token 32 and 64 --
-    fused is 2.2us faster at 32, Opus 0.9us faster at 64 and 10.6us faster at
-    512 -- and the rule puts the boundary at token 56.
+    The crossover moves with the expert count faster than routed_rows ~
+    num_experts predicts. Measured in a HIP graph on gfx950 (tokens where Opus
+    starts to win): NE=896 topk=16 ~50, 513/11 ~78, 385/9 ~108, 256/8 ~160,
+    289/9 ~165, 257/9 ~225, 129/5 ~850. Both products below stay within
+    0.4us of the faster sort on all of them; the old 3 * routed_rows >=
+    4 * num_experts rule lost up to 1.2us at 289/9 and 2.2us at 129/5.
 
     Callers that cannot supply the shape keep the old conservative answer.
     """
@@ -129,9 +132,9 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
         return False
     if block_size != 16:
         return True
-    if routed_rows is None or num_experts is None:
+    if routed_rows is None or num_experts is None or tokens is None:
         return False
-    return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
+    return tokens * num_experts >= 40_000 and routed_rows * num_experts >= 400_000
 
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
@@ -640,7 +643,7 @@ def _moe_sorting_impl(
     if (
         output_aux
         and expert_mask is None
-        and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
+        and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts, M)
         and _mxfp4_aux_instance_supported(
             num_experts, topk, model_dim, block_size, accumulate
         )
@@ -701,7 +704,7 @@ def _moe_sorting_impl(
     if output_aux:
         use_opus = True
         dispatch_policy = (
-            0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts) else 1
+            0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts, M) else 1
         )
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
@@ -3832,7 +3835,7 @@ def _mxmoe_opus_call_unsupported(
             )
     M, topk = topk_ids.shape
     generated_sort = not _aux_uses_opus(
-        metadata.output_aux, metadata.block_m, M * topk, w1.shape[0]
+        metadata.output_aux, metadata.block_m, M * topk, w1.shape[0], M
     ) and _MOE_SORT_BACKEND not in ("opus", "ck")
     if generated_sort and not _mxfp4_aux_instance_supported(
         w1.shape[0],
