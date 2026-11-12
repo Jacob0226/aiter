@@ -79,7 +79,9 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 AUX_SORT_OPUS = "opus"
 
 
-def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
+def _aux_uses_opus(
+    output_aux, block_size, routed_rows=None, num_experts=None, tokens=None
+):
     """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
 
     block_size 16 has no three-stage sort instance -- codegen emits `aux_sort3s_*`
@@ -101,9 +103,11 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
         return False
     if block_size != 16:
         return True
-    if routed_rows is None or num_experts is None:
+    if routed_rows is None or num_experts is None or tokens is None:
         return False
-    return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
+    return (
+        tokens * num_experts >= 40_000 and routed_rows * num_experts >= 400_000
+    )
 
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
@@ -585,7 +589,7 @@ def _moe_sorting_impl(
     if (
         output_aux
         and expert_mask is None
-        and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
+        and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts, M)
         and _mxfp4_aux_instance_supported(
             num_experts, topk, model_dim, block_size, accumulate
         )
@@ -641,7 +645,7 @@ def _moe_sorting_impl(
     if output_aux:
         use_opus = True
         dispatch_policy = (
-            0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts) else 1
+            0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts, M) else 1
         )
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
